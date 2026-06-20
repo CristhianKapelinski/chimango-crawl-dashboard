@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<meta name="description" content="ChimangoScan tag-backfill crawl monitor.">
+<title>crawl backfill · pipeline monitor</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='4' fill='%230b0d11'/%3E%3Cpath d='M5 22 L11 14 L17 19 L27 7' stroke='%2356c596' stroke-width='2' fill='none' stroke-linejoin='round' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+
+<a class="skip" href="#main">Skip to content</a>
+
+<header role="banner">
+  <div class="brand">
+    <span class="logo" aria-hidden="true"></span>
+    <div>
+      <h1>crawl backfill</h1>
+      <p class="tag">tag-backfill pipeline · chimangoscan</p>
+    </div>
+  </div>
+  <div class="status-cluster" aria-live="polite">
+    <span class="health" id="health" data-state="loading" aria-label="connection state">
+      <span class="health-dot" aria-hidden="true"></span>
+      <span class="health-label">connecting</span>
+    </span>
+    <time id="last-update" datetime="">—</time>
+    <button id="refresh" type="button" aria-label="Refresh now">refresh</button>
+  </div>
+</header>
+
+<main id="main">
+
+  <section aria-labelledby="kpi-h">
+    <h2 id="kpi-h" class="sec-title">overview</h2>
+    <div class="kpis" id="kpis">
+      <div class="kpi skeleton" aria-hidden="true"><div class="lbl"></div><div class="val"></div></div>
+      <div class="kpi skeleton" aria-hidden="true"><div class="lbl"></div><div class="val"></div></div>
+      <div class="kpi skeleton" aria-hidden="true"><div class="lbl"></div><div class="val"></div></div>
+      <div class="kpi skeleton" aria-hidden="true"><div class="lbl"></div><div class="val"></div></div>
+    </div>
+    <div class="progress" role="group" aria-labelledby="progress-h">
+      <div class="progress-meta">
+        <span id="progress-h">backfilled / eligible</span>
+        <span id="progress-label" class="mono"></span>
+      </div>
+      <div class="bar" aria-hidden="true"><div class="bar-fill" id="bar-fill"></div><div class="bar-inflight" id="bar-inflight"></div></div>
+      <div class="progress-foot">
+        <span><span class="legend backfilled"></span> backfilled</span>
+        <span><span class="legend inflight"></span> in flight</span>
+        <span><span class="legend pending"></span> pending</span>
+      </div>
+    </div>
+  </section>
+
+  <section aria-labelledby="rate-h">
+    <h2 id="rate-h" class="sec-title">throughput · last 24 h</h2>
+    <div class="chart-card">
+      <div class="chart-meta">
+        <div>
+          <span class="lbl">aggregate rate</span>
+          <span class="val mono" id="agg-rate">—</span>
+          <span class="unit">repos/min</span>
+        </div>
+        <div>
+          <span class="lbl">eta to zero</span>
+          <span class="val mono" id="eta-human">—</span>
+        </div>
+      </div>
+      <div class="canvas-box"><canvas id="chart-history" aria-label="Backfilled repositories per 15-minute bucket"></canvas></div>
+    </div>
+  </section>
+
+  <section aria-labelledby="workers-h">
+    <h2 id="workers-h" class="sec-title">workers</h2>
+    <p class="sec-desc" id="workers-summary"></p>
+    <div class="workers" id="workers" role="list"></div>
+  </section>
+
+  <div class="grid-2">
+    <section aria-labelledby="inflight-h">
+      <h2 id="inflight-h" class="sec-title">in flight</h2>
+      <p class="sec-desc">repos claimed by a worker, not yet marked backfilled</p>
+      <ol class="repo-list" id="inflight-list"></ol>
+    </section>
+
+    <section aria-labelledby="recent-h">
+      <h2 id="recent-h" class="sec-title">recently completed</h2>
+      <p class="sec-desc">last repos marked tags_backfilled_at</p>
+      <ol class="repo-list" id="recent-list"></ol>
+    </section>
+  </div>
+
+  <section aria-labelledby="top-h">
+    <h2 id="top-h" class="sec-title">next in queue</h2>
+    <p class="sec-desc">highest-pull repos still pending — claim order: pull_count DESC</p>
+    <ol class="repo-list two-col" id="top-list"></ol>
+  </section>
+
+  <section aria-labelledby="errors-h" id="errors-section" hidden>
+    <h2 id="errors-h" class="sec-title">recent errors</h2>
+    <p class="sec-desc">aggregated WARN/ERROR lines per worker · last 300 lines</p>
+    <div class="errors" id="errors"></div>
+  </section>
+
+</main>
+
+<footer role="contentinfo">
+  <span>crawl backfill monitor · polling every <span id="poll-interval">10</span> s</span>
+  <span class="mono">source: <a href="https://github.com/CristhianKapelinski/chimango-crawl-dashboard">cristhiankapelinski/chimango-crawl-dashboard</a></span>
+</footer>
+
+<dialog id="auth-dialog" aria-labelledby="auth-h">
+  <form method="dialog">
+    <h2 id="auth-h">api key required</h2>
+    <p>This dashboard talks to a private backend. Paste the X-API-Key value.</p>
+    <label for="auth-input">API key</label>
+    <input id="auth-input" type="password" autocomplete="off" required>
+    <div class="auth-actions">
+      <button type="submit" value="save" id="auth-save">save</button>
+    </div>
+  </form>
+</dialog>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js" defer></script>
+<script src="./app.js" defer></script>
+</body>
+</html>

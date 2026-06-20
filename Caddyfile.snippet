@@ -1,0 +1,46 @@
+# Append this to /etc/caddy/Caddyfile on the dashboard host.
+# Reload with:  sudo systemctl reload caddy
+#
+# Assumes:
+#   * The frontend is deployed to /srv/crawl-dashboard
+#     (`make deploy-frontend` does this).
+#   * docker-compose.yml exposes the backend on 127.0.0.1:8930.
+#   * The Cloudflare record for crawl.anonshield.org is DNS-only (gray cloud)
+#     so Caddy can solve the ACME HTTP-01 challenge directly.
+
+crawl.anonshield.org {
+    encode zstd gzip
+
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        Permissions-Policy "geolocation=(), microphone=(), camera=()"
+        Cache-Control "no-store"
+        -Server
+    }
+
+    log {
+        output file /var/log/caddy/crawl.anonshield.org-access.log {
+            roll_size 100mb
+            roll_keep 10
+        }
+        format json
+    }
+
+    @api path /api/* /healthz
+    handle @api {
+        reverse_proxy 127.0.0.1:8930 {
+            health_uri /healthz
+            health_interval 30s
+            health_timeout 4s
+        }
+    }
+
+    handle {
+        root * /srv/crawl-dashboard
+        try_files {path} /index.html
+        file_server
+    }
+}

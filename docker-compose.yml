@@ -1,0 +1,57 @@
+name: chimango-crawl-dashboard
+
+services:
+  # autossh sidecar exposes the coordinator's mongo as `tunnel:27017` inside
+  # this compose network. Keeps DB credentials off the host firewall and lets
+  # the backend point at a stable name regardless of where it runs.
+  tunnel:
+    image: alpine/socat:1.8.0.0
+    restart: unless-stopped
+    depends_on: []
+    command: >
+      sh -c 'apk add --no-cache openssh-client autossh >/dev/null &&
+             exec autossh -M 0 -N
+                  -o ServerAliveInterval=30 -o ServerAliveCountMax=3
+                  -o StrictHostKeyChecking=accept-new
+                  -o ExitOnForwardFailure=yes
+                  -o UserKnownHostsFile=/tmp/known_hosts
+                  -i /keys/id_ed25519
+                  -p $${TUNNEL_SSH_PORT:-22}
+                  -L 0.0.0.0:27017:$${TUNNEL_REMOTE_MONGO}
+                  $${TUNNEL_SSH_USER}@$${TUNNEL_SSH_HOST}'
+    environment:
+      TUNNEL_SSH_HOST: ${TUNNEL_SSH_HOST}
+      TUNNEL_SSH_USER: ${TUNNEL_SSH_USER}
+      TUNNEL_SSH_PORT: ${TUNNEL_SSH_PORT:-22}
+      TUNNEL_REMOTE_MONGO: ${TUNNEL_REMOTE_MONGO:-127.0.0.1:27017}
+    volumes:
+      - /etc/ssh-tunnel:/keys:ro
+    networks: [internal]
+
+  backend:
+    build: ./backend
+    image: chimango-crawl-dashboard-backend:latest
+    restart: unless-stopped
+    depends_on: [tunnel]
+    environment:
+      MONGO_URI: ${MONGO_URI}
+      MONGO_DB: ${MONGO_DB:-dockerhub_data}
+      API_KEY: ${API_KEY}
+      PULL_THRESHOLD: ${PULL_THRESHOLD:-72}
+      CORS_ORIGINS: ${CORS_ORIGINS:-}
+      WORKER_HOSTS: ${WORKER_HOSTS:-}
+      WORKER_LOGS_DIR: /data/worker_logs
+      STALL_SECONDS: ${STALL_SECONDS:-600}
+      HISTORY_HOURS: ${HISTORY_HOURS:-24}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    ports:
+      - "127.0.0.1:8930:8930"
+    volumes:
+      # Worker logs are rsynced into this directory on the host by the cron
+      # described in docs/operations.md.
+      - /var/lib/chimango-crawl/worker_logs:/data/worker_logs:ro
+    networks: [internal]
+
+networks:
+  internal:
+    driver: bridge
