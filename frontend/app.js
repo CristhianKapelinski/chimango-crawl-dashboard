@@ -112,11 +112,16 @@
       `${summary.down || 0} down`,
     ];
     if (summary.stuck) parts.push(`${summary.stuck} stuck`);
-    /* tags/min is the canonical throughput signal — repos vary by orders of
-       magnitude in tag count, so repos/min is biased. We keep repos/min as a
-       secondary readout for continuity with old dashboards/screenshots. */
+    /* imgs/min is the canonical throughput signal — each img maps to one
+       GetImages call plus one images_data insert and one Neo4j MERGE batch,
+       so it measures real downstream work. tags/min only measures paged
+       tag-listing speed (100 tags per request, often cache hits with zero
+       downstream writes). repos/min stays for continuity and ETA basis. */
+    if (summary.aggregate_imgs_per_min != null) {
+      parts.push(`aggregate ${summary.aggregate_imgs_per_min.toFixed(1)} imgs/min`);
+    }
     if (summary.aggregate_tags_per_min != null) {
-      parts.push(`aggregate ${summary.aggregate_tags_per_min.toFixed(1)} tags/min`);
+      parts.push(`${summary.aggregate_tags_per_min.toFixed(1)} tags/min`);
     }
     parts.push(`${(summary.aggregate_rate_per_min || 0).toFixed(1)} repos/min`);
     $("#workers-summary").textContent = parts.join(" · ");
@@ -138,11 +143,13 @@
       const topErr = (w.top_errors && w.top_errors[0]) || null;
       const pillLabel = w.stuck ? `${w.status} · stuck` : w.status;
 
-      /* tags/min sits in the headline slot (where "rate" used to be) because
-         it is the unbiased throughput signal — a single repo can carry 10k
-         tags, so repos/min hides large variations in real work. repos/min
-         and imgs/min remain as secondary rows. A worker on the old binary
-         emits no tags/min: we render '—' so the absence is explicit. */
+      /* imgs/min sits in the headline slot because each imgs unit corresponds
+         to a real GetImages API call plus an images_data insert and a Neo4j
+         layer MERGE batch — actual downstream work persisted. tags/min only
+         measures tag-listing throughput (100/page, often cache hits with no
+         downstream writes) and stays as a secondary row. repos/min remains
+         as the tertiary readout and the ETA basis. A worker on the old
+         binary emits no imgs/min: we render '—' so the absence is explicit. */
       const tags = m.tags_per_min;
       const imgs = m.imgs_per_min;
       node.innerHTML = `
@@ -150,9 +157,9 @@
           <span class="host">${escapeHTML(w.host)}</span>
           <span class="pill">${escapeHTML(pillLabel)}</span>
         </div>
-        <div class="row primary"><span class="k">tags/min</span><span class="v">${tags != null ? tags.toFixed(0) : "—"}</span></div>
-        <div class="row"><span class="k">imgs/min</span><span class="v">${imgs != null ? imgs.toFixed(0) : "—"}</span></div>
-        <div class="row"><span class="k">repos/min</span><span class="v">${m.rate_per_min != null ? m.rate_per_min.toFixed(1) : "—"}</span></div>
+        <div class="row primary" title="API + DB writes per minute" aria-label="imgs/min — primary: API + DB writes per minute"><span class="k">imgs/min</span><span class="v">${imgs != null ? imgs.toFixed(0) : "—"}</span></div>
+        <div class="row" title="tag list throughput" aria-label="tags/min — secondary: tag list throughput"><span class="k">tags/min</span><span class="v">${tags != null ? tags.toFixed(0) : "—"}</span></div>
+        <div class="row" title="repos completed (ETA basis)" aria-label="repos/min — tertiary: repos completed, ETA basis"><span class="k">repos/min</span><span class="v">${m.rate_per_min != null ? m.rate_per_min.toFixed(1) : "—"}</span></div>
         <div class="row"><span class="k">processed</span><span class="v">${m.processed != null ? fmtInt(m.processed) : "—"}</span></div>
         <div class="row"><span class="k">errors</span><span class="v">${m.errors != null ? fmtInt(m.errors) : "—"}</span></div>
         <div class="row"><span class="k">eta</span><span class="v">${escapeHTML(m.eta || "—")}</span></div>
@@ -325,10 +332,13 @@
       renderWorkers(overview.workers);
       renderHistory(history);
 
-      /* Headline = tags/min (unbiased throughput). repos/min stays as the
-         secondary readout, partly for continuity and partly because the ETA
-         is still derived from it — the universe of tags is unknown until each
-         repo is listed, so a tags-based ETA is not well defined. */
+      /* Headline = imgs/min: every img unit is a GetImages call plus a Mongo
+         images_data insert plus a Neo4j layer-MERGE batch — real persisted
+         downstream work. tags/min only counts paged tag-listing (100 per
+         request, frequently cache hits with zero downstream writes) and is
+         shown as a secondary readout. repos/min remains as the tertiary
+         readout and the ETA basis — the universe of tags/imgs is unknown
+         until each repo is listed, so only a repos-based ETA is well-defined. */
       const wsum = (overview.workers && overview.workers.summary) || {};
       const tagsAgg = wsum.aggregate_tags_per_min;
       const imgsAgg = wsum.aggregate_imgs_per_min;
