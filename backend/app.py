@@ -481,12 +481,19 @@ def _startup() -> None:
 
 @app.get("/healthz")
 def healthz() -> dict:
+    """Process liveness. Cheap and unconditional so the reverse proxy never
+    marks the backend as down because Mongo is slow — Mongo health is exposed
+    separately at /healthz/db."""
+    return {"status": "ok", "ts": time.time()}
+
+
+@app.get("/healthz/db")
+def healthz_db() -> dict:
     try:
         mongo().admin.command("ping")
-        mongo_ok = True
-    except Exception:
-        mongo_ok = False
-    return {"status": "ok" if mongo_ok else "degraded", "mongo": mongo_ok, "ts": time.time()}
+        return {"status": "ok", "mongo": True, "ts": time.time()}
+    except Exception as exc:
+        return {"status": "degraded", "mongo": False, "error": str(exc)[:200], "ts": time.time()}
 
 
 @app.get("/api/v1/progress", dependencies=[Depends(require_api_key)])
