@@ -28,9 +28,9 @@ when Mongo is briefly unreachable or worker logs are missing.
 
 ```
                   ┌─────────────────────┐
-   workers ──rsync│ /var/lib/chimango-  │
-   (~12 hosts)    │  crawl/worker_logs  │──ro mount──┐
-                  └─────────────────────┘            │
+   workers ──HTTPS│ /var/lib/chimango-  │
+   POST tail/min  │  crawl/worker_logs  │──rw mount──┐
+   (~12 hosts)    └─────────────────────┘            │
                                                      ▼
    ┌────────────────────┐   SSH tunnel      ┌────────────────────┐
    │ coordinator mongo  │◄──────────────────│ tunnel  (autossh)  │
@@ -99,7 +99,7 @@ The most relevant ones:
 | `MONGO_URI`       | `mongodb://tunnel:27017` | Inside the compose network the autossh sidecar exposes this address    |
 | `API_KEY`         | —                        | Shared secret; clients send `X-API-Key: …` (>= 32 bytes recommended)   |
 | `PULL_THRESHOLD`  | `72`                     | Stage II floor; matches the value used by the crawler                  |
-| `WORKER_HOSTS`    | `l01,…,rtx2`             | Display order in the worker grid                                       |
+| `WORKER_HOSTS`    | `l01,…,rtx3060-01`       | Display order + allow-list for `POST /api/v1/metrics/{host}` uploads   |
 | `STALL_SECONDS`   | `600`                    | A worker is "stalled" if its log has not been touched for this long    |
 | `HISTORY_HOURS`   | `24`                     | Throughput chart window                                                |
 
@@ -127,7 +127,7 @@ re-enter the key in the dialog.
 See [`docs/operations.md`](docs/operations.md) for:
 
 * adding or removing a worker host
-* validating the worker log rsync cron
+* deploying the per-minute push cron to the fleet
 * debugging "stalled" vs "down" worker states
 * rotating Mongo / API credentials safely
 * what to do when Mongo is unreachable

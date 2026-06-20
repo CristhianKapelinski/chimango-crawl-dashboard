@@ -18,15 +18,15 @@ import os
 import re
 import threading
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Path as PathParam, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError
 
@@ -45,6 +45,14 @@ WORKER_HOSTS = [h.strip() for h in os.environ.get("WORKER_HOSTS", "").split(",")
 WORKER_LOGS_DIR = os.environ.get("WORKER_LOGS_DIR", "/data/worker_logs")
 STALL_SECONDS = int(os.environ.get("STALL_SECONDS", "600"))
 HISTORY_HOURS = int(os.environ.get("HISTORY_HOURS", "24"))
+
+# Upload knobs for POST /api/v1/metrics/{host}. Workers push the tail of their
+# local backfill_metrics.log here every minute (cron). The dashboard host does
+# not have inbound SSH to workers, so the flow is inverted: workers reach the
+# public dashboard URL over HTTPS and push.
+METRICS_MAX_BYTES = int(os.environ.get("METRICS_MAX_BYTES", str(2 * 1024 * 1024)))
+METRICS_RATE_PER_MIN = int(os.environ.get("METRICS_RATE_PER_MIN", "12"))
+WORKER_HOST_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,62}$")
 
 TTL_FAST = 10.0
 TTL_SLOW = 30.0
@@ -440,6 +448,71 @@ def _humanize(seconds: float) -> str:
     return " ".join(parts) if parts else "<1m"
 
 
+# ---------- worker metrics upload -----------------------------------------
+
+class RateLimiter:
+    """Per-key sliding window. Cheap, no external deps, plenty for ~12 keys.
+
+    A worker that gets paused or restarted may retry; the limiter exists to
+    cap a misbehaving client, not to police well-behaved cron."""
+
+    def __init__(self, max_per_minute: int) -> None:
+        self._max = max_per_minute
+        self._window = 60.0
+        self._hits: dict[str, deque[float]] = defaultdict(deque)
+        self._lock = threading.Lock()
+
+    def allow(self, key: str) -> bool:
+        if self._max <= 0:
+            return True
+        now = time.monotonic()
+        with self._lock:
+            q = self._hits[key]
+            cutoff = now - self._window
+            while q and q[0] < cutoff:
+                q.popleft()
+            if len(q) >= self._max:
+                return False
+            q.append(now)
+            return True
+
+
+METRICS_LIMITER = RateLimiter(METRICS_RATE_PER_MIN)
+_ALLOWED_UPLOAD_CT = ("text/plain", "application/octet-stream")
+
+
+def _valid_worker_host(host: str) -> bool:
+    if not WORKER_HOST_RE.match(host):
+        return False
+    return host in WORKER_HOSTS
+
+
+def _atomic_write_log(host: str, payload: bytes) -> Path:
+    """Write payload to worker_logs/<host>/backfill_metrics.log via a tmp file
+    rename so a concurrent read never observes a torn file. Bumps mtime even
+    when the content is byte-identical to the previous upload, so the
+    dashboard's freshness check ("stalled" if mtime is older than
+    STALL_SECONDS) sees the worker as live."""
+    base = Path(WORKER_LOGS_DIR) / host
+    base.mkdir(parents=True, exist_ok=True)
+    target = base / "backfill_metrics.log"
+    tmp = base / f".backfill_metrics.log.{os.getpid()}.{threading.get_ident()}.tmp"
+    try:
+        with tmp.open("wb") as f:
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, target)
+        now = time.time()
+        os.utime(target, (now, now))
+    finally:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+    return target
+
+
 # ---------- app ------------------------------------------------------------
 
 app = FastAPI(
@@ -510,6 +583,61 @@ def api_history(hours: int | None = None) -> dict:
 @app.get("/api/v1/workers", dependencies=[Depends(require_api_key)])
 def api_workers() -> dict:
     return CACHE.get_or_set("workers", TTL_FAST, workers_snapshot)
+
+
+@app.post(
+    "/api/v1/metrics/{host}",
+    status_code=200,
+    dependencies=[Depends(require_api_key)],
+)
+async def api_metrics_upload(
+    request: Request,
+    host: str = PathParam(..., min_length=1, max_length=63),
+    content_type: str | None = Header(default=None),
+) -> Response:
+    """Receive the tail of a worker's backfill_metrics.log.
+
+    Flow inversion vs. the original rsync-pull design: dashboard host (a9) can
+    reach the workers' DNS but most workers sit behind a private campus DNS,
+    so we let each worker push to the public HTTPS endpoint instead. Body is
+    the raw log tail (text), capped at METRICS_MAX_BYTES. Idempotent — the
+    same content can be re-uploaded harmlessly. Atomic write keeps concurrent
+    readers consistent."""
+    if not _valid_worker_host(host):
+        raise HTTPException(status_code=403, detail="unknown worker host")
+
+    if not METRICS_LIMITER.allow(host):
+        raise HTTPException(status_code=429, detail="rate limit exceeded")
+
+    ct = (content_type or "").split(";", 1)[0].strip().lower()
+    if ct and ct not in _ALLOWED_UPLOAD_CT:
+        raise HTTPException(status_code=415, detail="unsupported content type")
+
+    # Content-Length check first when the client sets it; some clients omit it.
+    declared = request.headers.get("content-length")
+    if declared:
+        try:
+            if int(declared) > METRICS_MAX_BYTES:
+                raise HTTPException(status_code=413, detail="payload too large")
+        except ValueError:
+            raise HTTPException(status_code=400, detail="invalid content-length")
+
+    # Stream into a bounded buffer so a lying Content-Length cannot exhaust RAM.
+    body = bytearray()
+    async for chunk in request.stream():
+        if not chunk:
+            continue
+        body.extend(chunk)
+        if len(body) > METRICS_MAX_BYTES:
+            raise HTTPException(status_code=413, detail="payload too large")
+
+    try:
+        _atomic_write_log(host, bytes(body))
+    except OSError as exc:
+        LOG.error("metrics upload write failed for %s: %s", host, exc)
+        raise HTTPException(status_code=500, detail="write failed") from exc
+
+    return Response(status_code=200)
 
 
 @app.get("/api/v1/in-flight", dependencies=[Depends(require_api_key)])
