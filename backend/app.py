@@ -105,7 +105,7 @@ def mongo() -> MongoClient:
                 serverSelectionTimeoutMS=5000,
                 connectTimeoutMS=5000,
                 socketTimeoutMS=15000,
-                appname="crawl-backfill-dashboard",
+                appname="chimango-crawl-dashboard",
             )
         return _client
 
