@@ -17,7 +17,7 @@ Live deployment: <https://crawl.anonshield.org>
 | Fleet signal       | tags collected 24 h, weighted cache hit, stuck-worker count, tag-count distribution histogram |
 | Rate-limit alert   | Banner surfaces Docker Hub 429s detected in worker error tails         |
 | Throughput chart   | `tags_backfilled_at` bucketed in 5–60 min windows over the last N h    |
-| Worker grid        | Tail of `backfill_metrics.log` per host (rate, ETA, errors, last seen); `stuck` workers (up but rate=0 >5 min) get an amber accent |
+| Worker grid        | Tail of `backfill_metrics.log` per host (tags/min headline, plus imgs/min, repos/min, ETA, errors, last seen); `stuck` workers (up but rate=0 >5 min) get an amber accent |
 | In-flight list     | Repos with `backfill_claimed=true`, newest first                       |
 | Recently completed | Repos with `tags_backfilled_at`, newest first                          |
 | Next in queue      | Highest-pull repos still pending — claim order is `pull_count DESC`    |

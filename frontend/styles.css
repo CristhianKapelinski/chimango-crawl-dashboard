@@ -274,6 +274,10 @@ section { display: flex; flex-direction: column; gap: var(--space-3); }
 }
 .chart-meta .val { font: 600 20px/1 var(--mono); color: var(--text); }
 .chart-meta .unit { font-size: 11px; color: var(--text-2); margin-top: 2px; }
+/* Primary block (tags/min) reads bigger and in the accent colour so it sits
+   clearly above the secondary readouts (imgs/min, repos/min, eta). */
+.chart-meta .primary .val { font-size: 26px; color: var(--accent); }
+.chart-meta .primary .lbl { color: var(--accent); }
 
 .canvas-box { position: relative; height: 240px; }
 canvas { width: 100% !important; height: 100% !important; }
@@ -324,6 +328,12 @@ canvas { width: 100% !important; height: 100% !important; }
 }
 .worker .row .k { color: var(--text-2); text-transform: lowercase; }
 .worker .row .v { color: var(--text); }
+/* Primary row carries the headline throughput (tags/min) — same slot the old
+   "rate" line used to occupy, but visually weightier so it reads as the
+   number that matters. */
+.worker .row.primary { font: 600 13px/1.3 var(--mono); }
+.worker .row.primary .k { color: var(--text-1); }
+.worker .row.primary .v { color: var(--accent); }
 
 .worker .err-line {
   font: 10px/1.3 var(--mono); color: var(--text-2);

@@ -112,7 +112,13 @@
       `${summary.down || 0} down`,
     ];
     if (summary.stuck) parts.push(`${summary.stuck} stuck`);
-    parts.push(`aggregate ${(summary.aggregate_rate_per_min || 0).toFixed(1)} repos/min`);
+    /* tags/min is the canonical throughput signal — repos vary by orders of
+       magnitude in tag count, so repos/min is biased. We keep repos/min as a
+       secondary readout for continuity with old dashboards/screenshots. */
+    if (summary.aggregate_tags_per_min != null) {
+      parts.push(`aggregate ${summary.aggregate_tags_per_min.toFixed(1)} tags/min`);
+    }
+    parts.push(`${(summary.aggregate_rate_per_min || 0).toFixed(1)} repos/min`);
     $("#workers-summary").textContent = parts.join(" · ");
 
     if (!snap.workers || snap.workers.length === 0) {
@@ -132,12 +138,21 @@
       const topErr = (w.top_errors && w.top_errors[0]) || null;
       const pillLabel = w.stuck ? `${w.status} · stuck` : w.status;
 
+      /* tags/min sits in the headline slot (where "rate" used to be) because
+         it is the unbiased throughput signal — a single repo can carry 10k
+         tags, so repos/min hides large variations in real work. repos/min
+         and imgs/min remain as secondary rows. A worker on the old binary
+         emits no tags/min: we render '—' so the absence is explicit. */
+      const tags = m.tags_per_min;
+      const imgs = m.imgs_per_min;
       node.innerHTML = `
         <div class="top">
           <span class="host">${escapeHTML(w.host)}</span>
           <span class="pill">${escapeHTML(pillLabel)}</span>
         </div>
-        <div class="row"><span class="k">rate</span><span class="v">${m.rate_per_min != null ? m.rate_per_min.toFixed(1) : "—"} /min</span></div>
+        <div class="row primary"><span class="k">tags/min</span><span class="v">${tags != null ? tags.toFixed(0) : "—"}</span></div>
+        <div class="row"><span class="k">imgs/min</span><span class="v">${imgs != null ? imgs.toFixed(0) : "—"}</span></div>
+        <div class="row"><span class="k">repos/min</span><span class="v">${m.rate_per_min != null ? m.rate_per_min.toFixed(1) : "—"}</span></div>
         <div class="row"><span class="k">processed</span><span class="v">${m.processed != null ? fmtInt(m.processed) : "—"}</span></div>
         <div class="row"><span class="k">errors</span><span class="v">${m.errors != null ? fmtInt(m.errors) : "—"}</span></div>
         <div class="row"><span class="k">eta</span><span class="v">${escapeHTML(m.eta || "—")}</span></div>
@@ -310,6 +325,15 @@
       renderWorkers(overview.workers);
       renderHistory(history);
 
+      /* Headline = tags/min (unbiased throughput). repos/min stays as the
+         secondary readout, partly for continuity and partly because the ETA
+         is still derived from it — the universe of tags is unknown until each
+         repo is listed, so a tags-based ETA is not well defined. */
+      const wsum = (overview.workers && overview.workers.summary) || {};
+      const tagsAgg = wsum.aggregate_tags_per_min;
+      const imgsAgg = wsum.aggregate_imgs_per_min;
+      $("#agg-tags").textContent = tagsAgg != null ? tagsAgg.toFixed(0) : "—";
+      $("#agg-imgs").textContent = imgsAgg != null ? imgsAgg.toFixed(0) : "—";
       $("#agg-rate").textContent = (overview.eta.rate_per_min || 0).toFixed(1);
       $("#eta-human").textContent = overview.eta.human || "—";
 

@@ -508,6 +508,12 @@ def _parse_worker(host: str) -> dict:
             "total": int(last_metric["total"]),
             "pct": float(last_metric["pct"]),
             "rate_per_min": float(last_metric["rate"]),
+            # tags/min and imgs/min are emitted by newer worker binaries only.
+            # When a worker is still on the old format the regex groups are
+            # None — we surface that as None so the UI shows '—' instead of
+            # rendering a misleading zero.
+            "tags_per_min": float(last_metric["tags_rate"]) if last_metric.get("tags_rate") else None,
+            "imgs_per_min": float(last_metric["imgs_rate"]) if last_metric.get("imgs_rate") else None,
             "eta": last_metric["eta"].strip(),
             "tag_cache_pct": float(last_metric["tag_cache"]),
             "img_cache_pct": float(last_metric["img_cache"]),
@@ -577,7 +583,18 @@ def workers_snapshot() -> dict:
     snaps = [_parse_worker(h) for h in hosts]
     for s in snaps:
         s["stuck"] = _is_stuck(s)
-    total_rate = sum((s["metrics"] or {}).get("rate_per_min", 0) for s in snaps if s["metrics"])
+    # Aggregate over UP workers only: a stalled/down worker's last-known rate
+    # is a stale snapshot of throughput that no longer exists, so summing it
+    # would inflate the headline. tags/imgs from old-format workers (None) are
+    # skipped — partial-fleet aggregates are still useful and avoid forcing a
+    # binary upgrade to read a headline.
+    up = [s for s in snaps if s["status"] == "up" and s["metrics"]]
+    total_rate = sum(s["metrics"].get("rate_per_min", 0) or 0 for s in up)
+    total_tags = sum(s["metrics"].get("tags_per_min") or 0 for s in up
+                     if s["metrics"].get("tags_per_min") is not None)
+    total_imgs = sum(s["metrics"].get("imgs_per_min") or 0 for s in up
+                     if s["metrics"].get("imgs_per_min") is not None)
+    new_format_workers = sum(1 for s in up if s["metrics"].get("tags_per_min") is not None)
     return {
         "workers": snaps,
         "summary": {
@@ -587,6 +604,9 @@ def workers_snapshot() -> dict:
             "down": sum(1 for s in snaps if s["status"] == "down"),
             "stuck": sum(1 for s in snaps if s.get("stuck")),
             "aggregate_rate_per_min": round(total_rate, 2),
+            "aggregate_tags_per_min": round(total_tags, 2) if new_format_workers else None,
+            "aggregate_imgs_per_min": round(total_imgs, 2) if new_format_workers else None,
+            "workers_reporting_tags": new_format_workers,
         },
         "ts": _utcnow().isoformat(),
     }

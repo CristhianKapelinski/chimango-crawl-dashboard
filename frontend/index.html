@@ -93,14 +93,25 @@
     <h2 id="rate-h" class="sec-title">throughput · last 24 h</h2>
     <div class="chart-card">
       <div class="chart-meta">
+        <div class="primary">
+          <span class="lbl">aggregate throughput</span>
+          <span class="val mono" id="agg-tags">—</span>
+          <span class="unit">tags/min</span>
+        </div>
         <div>
-          <span class="lbl">aggregate rate</span>
+          <span class="lbl">images</span>
+          <span class="val mono" id="agg-imgs">—</span>
+          <span class="unit">imgs/min</span>
+        </div>
+        <div>
+          <span class="lbl">repos</span>
           <span class="val mono" id="agg-rate">—</span>
           <span class="unit">repos/min</span>
         </div>
         <div>
           <span class="lbl">eta to zero</span>
           <span class="val mono" id="eta-human">—</span>
+          <span class="unit">repos basis</span>
         </div>
       </div>
       <div class="canvas-box"><canvas id="chart-history" aria-label="Backfilled repositories per 15-minute bucket"></canvas></div>
