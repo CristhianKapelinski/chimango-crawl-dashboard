@@ -14,12 +14,20 @@ Live deployment: <https://crawl.anonshield.org>
 | Panel              | Source                                                                 |
 | ------------------ | ---------------------------------------------------------------------- |
 | KPIs + progress    | `repositories_data` counts: eligible / backfilled / in-flight / pending |
+| Fleet signal       | tags collected 24 h, weighted cache hit, stuck-worker count, tag-count distribution histogram |
+| Rate-limit alert   | Banner surfaces Docker Hub 429s detected in worker error tails         |
 | Throughput chart   | `tags_backfilled_at` bucketed in 5–60 min windows over the last N h    |
-| Worker grid        | Tail of `backfill_metrics.log` per host (rate, ETA, errors, last seen) |
+| Worker grid        | Tail of `backfill_metrics.log` per host (rate, ETA, errors, last seen); `stuck` workers (up but rate=0 >5 min) get an amber accent |
 | In-flight list     | Repos with `backfill_claimed=true`, newest first                       |
 | Recently completed | Repos with `tags_backfilled_at`, newest first                          |
 | Next in queue      | Highest-pull repos still pending — claim order is `pull_count DESC`    |
 | Errors rollup      | Aggregated WARN/ERROR lines from each worker's last 300 lines          |
+
+The page runs two polling cadences: a fast cycle (10 s, default) refreshes
+overview / workers / throughput; a slow cycle (60 s) refreshes the in-flight,
+recently-completed, next-in-queue and fleet-signal panels. Backend TTLs are
+aligned so polling more aggressively only churns the cache without reaching
+Mongo any sooner. Manual `refresh` forces both cycles immediately.
 
 Empty, loading and error states are first-class — the page is readable even
 when Mongo is briefly unreachable or worker logs are missing.

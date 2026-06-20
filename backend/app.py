@@ -24,6 +24,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from bson import ObjectId
 from fastapi import Depends, FastAPI, Header, HTTPException, Path as PathParam, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
@@ -55,8 +56,31 @@ METRICS_RATE_PER_MIN = int(os.environ.get("METRICS_RATE_PER_MIN", "12"))
 WORKER_HOST_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,62}$")
 
 TTL_FAST = 10.0
-TTL_SLOW = 30.0
+TTL_SLOW = 60.0
 TTL_COUNT = 60.0
+TTL_HEAVY = 600.0
+
+# Buckets for the per-repo tag-count distribution. Edges are exclusive on the
+# upper end; the final "1000+" bucket catches the long tail that motivates the
+# whole backfill stage (recent-only crawl missed thousands of historical tags).
+TAG_HIST_EDGES = (1, 10, 100, 1000)
+TAG_HIST_LABELS = ("1-9", "10-99", "100-999", "1000+")
+
+# Sampling cap for the tag distribution aggregate. The aggregate touches every
+# tag row owned by repos backfilled in the window, so we bound the work to a
+# recent slice rather than the whole corpus. 500 covers the noisiest 24h on the
+# current fleet without breaking the maxTimeMS budget.
+TAG_HIST_SAMPLE = int(os.environ.get("TAG_HIST_SAMPLE", "500"))
+TAG_HIST_WINDOW_HOURS = int(os.environ.get("TAG_HIST_WINDOW_HOURS", "24"))
+
+# A worker that has been "up" (log mtime fresh) but reporting rate=0 for longer
+# than this is degraded — usually a stuck pull, OAuth refresh, or a dead Mongo
+# session. Flagged distinctly from `stalled` (which means the log went silent).
+WORKER_STUCK_SECONDS = int(os.environ.get("WORKER_STUCK_SECONDS", "300"))
+
+# Substrings that mark a Docker Hub HTTP 429 / token-bucket rejection in the
+# worker error tail. Kept conservative — the warning is a heads-up, not a page.
+RATE_LIMIT_MARKERS = ("429", "toomanyrequests", "rate limit", "rate-limit")
 
 
 # ---------- cache ----------------------------------------------------------
@@ -315,14 +339,111 @@ def top_pending(limit: int = 25) -> list[dict]:
     ]
 
 
+def tags_collected(hours: int = 24) -> dict:
+    """Approximate count of tag documents inserted in the last N hours.
+
+    Uses the implicit timestamp inside the BSON ObjectId rather than scanning a
+    date field, so it is O(log n) over the default `_id` index regardless of
+    collection size. The count is approximate to within one second (the ObjectId
+    timestamp granularity), which is plenty for a dashboard tile."""
+    cutoff = _utcnow() - timedelta(hours=hours)
+    oid = ObjectId.from_datetime(cutoff)
+    coll = mongo()[MONGO_DB].tags_data
+    count = coll.count_documents({"_id": {"$gte": oid}}, maxTimeMS=10000)
+    return {"hours": hours, "count": count, "ts": _utcnow().isoformat()}
+
+
+def backfilled_window(hours: int = 24) -> int:
+    """Repos marked `tags_backfilled_at` within the window. Cheap thanks to the
+    partial index `dash_backfill_done_recent` we already keep."""
+    cutoff = (_utcnow() - timedelta(hours=hours)).isoformat()
+    return repos().count_documents(
+        {"tags_backfilled_at": {"$gte": cutoff}}, maxTimeMS=10000,
+    )
+
+
+def tag_distribution(sample: int = TAG_HIST_SAMPLE, hours: int = TAG_HIST_WINDOW_HOURS) -> dict:
+    """Histogram of tag count per repo for the most recently backfilled slice.
+
+    The aggregate is bounded twice: (a) only repos backfilled in the last `hours`
+    contribute, (b) we keep at most `sample` of those. That keeps the pipeline
+    O(sample * avg_tags_per_repo) instead of touching the full tags_data
+    collection. The buckets are computed in Python after $group because Mongo's
+    $bucket needs explicit edges and we want a single round trip."""
+    cutoff = (_utcnow() - timedelta(hours=hours)).isoformat()
+    sample_repos = list(repos().find(
+        {"tags_backfilled_at": {"$gte": cutoff}},
+        {"namespace": 1, "name": 1, "_id": 0},
+        sort=[("tags_backfilled_at", -1)],
+        limit=sample,
+        max_time_ms=10000,
+    ))
+    if not sample_repos:
+        return {
+            "sample_repos": 0,
+            "hours": hours,
+            "buckets": [{"label": lbl, "count": 0} for lbl in TAG_HIST_LABELS],
+            "ts": _utcnow().isoformat(),
+        }
+
+    pairs = [{"repositories_namespace": r["namespace"], "repositories_name": r["name"]}
+             for r in sample_repos if r.get("namespace") and r.get("name")]
+    if not pairs:
+        return {"sample_repos": 0, "hours": hours,
+                "buckets": [{"label": lbl, "count": 0} for lbl in TAG_HIST_LABELS],
+                "ts": _utcnow().isoformat()}
+
+    pipeline = [
+        {"$match": {"$or": pairs}},
+        {"$group": {
+            "_id": {"ns": "$repositories_namespace", "n": "$repositories_name"},
+            "tags": {"$sum": 1},
+        }},
+    ]
+    counts = []
+    try:
+        for doc in mongo()[MONGO_DB].tags_data.aggregate(
+            pipeline, allowDiskUse=True, maxTimeMS=20000,
+        ):
+            counts.append(int(doc.get("tags", 0)))
+    except PyMongoError as exc:
+        LOG.warning("tag distribution aggregate failed: %s", exc)
+        return {"sample_repos": 0, "hours": hours,
+                "buckets": [{"label": lbl, "count": 0} for lbl in TAG_HIST_LABELS],
+                "error": "aggregate failed", "ts": _utcnow().isoformat()}
+
+    buckets = [0] * len(TAG_HIST_LABELS)
+    for c in counts:
+        if c >= TAG_HIST_EDGES[3]:
+            buckets[3] += 1
+        elif c >= TAG_HIST_EDGES[2]:
+            buckets[2] += 1
+        elif c >= TAG_HIST_EDGES[1]:
+            buckets[1] += 1
+        elif c >= TAG_HIST_EDGES[0]:
+            buckets[0] += 1
+    return {
+        "sample_repos": len(counts),
+        "hours": hours,
+        "buckets": [{"label": lbl, "count": n} for lbl, n in zip(TAG_HIST_LABELS, buckets)],
+        "ts": _utcnow().isoformat(),
+    }
+
+
 # ---------- worker log parsing --------------------------------------------
 
-# Backfill metrics log line emitted by the worker:
-# [BACKFILL METRICS 18:01:12] progresso=12/3456 (0.3%) | taxa=2.4 repos/min | ETA=21h30m | cache tags=80% imgs=72% | neo4j=400 | erros=2 | uptime=5m0s
+# Backfill metrics log line emitted by the worker. Two formats are accepted:
+#   old: taxa=2.4 repos/min
+#   new: taxa=2.4 repos/min 845 tags/min 1320 imgs/min
+# The tags/imgs tail is optional so a worker on an older binary still parses;
+# the missing groups fall through as None and the dashboard renders '—'.
+# Example new line:
+# [BACKFILL METRICS 01:48:23] progresso=12/5600683 (0.0%) | taxa=1.2 repos/min 845 tags/min 1320 imgs/min | ETA=4dias | cache tags=2% imgs=8% | neo4j=18432 | erros=3 | uptime=12m45s
 METRIC_RE = re.compile(
     r"\[(?P<label>BACKFILL|BUILD) METRICS (?P<hms>\d\d:\d\d:\d\d)\] "
     r"progresso=(?P<done>\d+)/(?P<total>\d+) \((?P<pct>[\d.]+)%\) \| "
-    r"taxa=(?P<rate>[\d.]+) repos/min \| "
+    r"taxa=(?P<rate>[\d.]+) repos/min"
+    r"(?:\s+(?P<tags_rate>[\d.]+)\s+tags/min\s+(?P<imgs_rate>[\d.]+)\s+imgs/min)? \| "
     r"ETA=(?P<eta>[^|]+?) \| "
     r"cache tags=(?P<tag_cache>[\d.]+)% imgs=(?P<img_cache>[\d.]+)% \| "
     r"neo4j=(?P<neo4j>\d+) \| erros=(?P<errors>\d+) \| uptime=(?P<uptime>[^\s]+)"
@@ -401,6 +522,51 @@ def _parse_worker(host: str) -> dict:
     }
 
 
+def _parse_uptime_seconds(s: str | None) -> int | None:
+    """Parse the worker uptime token (e.g. '5m0s', '1h12m', '2d3h') to seconds.
+    Returns None if the token is missing or unrecognised — callers fall back to
+    a conservative default so a malformed log line never demotes a live worker."""
+    if not s:
+        return None
+    total = 0
+    cur = 0
+    seen = False
+    for ch in s:
+        if ch.isdigit():
+            cur = cur * 10 + int(ch)
+            seen = True
+        elif ch == "d" and seen:
+            total += cur * 86400; cur = 0; seen = False
+        elif ch == "h" and seen:
+            total += cur * 3600; cur = 0; seen = False
+        elif ch == "m" and seen:
+            total += cur * 60; cur = 0; seen = False
+        elif ch == "s" and seen:
+            total += cur; cur = 0; seen = False
+        else:
+            cur = 0; seen = False
+    return total if total > 0 else None
+
+
+def _is_stuck(snap: dict) -> bool:
+    """A worker is 'stuck' when its log is fresh (status==up) but the rate has
+    been flat at zero for longer than WORKER_STUCK_SECONDS. We approximate the
+    "how long at zero" duration by min(uptime, WORKER_STUCK_SECONDS+1) — without
+    a historical series we cannot tell exactly, but the heuristic only flags
+    workers that have been alive long enough for the rate to have moved."""
+    if snap.get("status") != "up":
+        return False
+    m = snap.get("metrics") or {}
+    if (m.get("rate_per_min") or 0) > 0:
+        return False
+    if m.get("processed", 0) > 0:
+        return True  # was producing, now at zero — almost certainly stuck
+    up_s = _parse_uptime_seconds(m.get("uptime"))
+    if up_s is None:
+        return False
+    return up_s >= WORKER_STUCK_SECONDS
+
+
 def workers_snapshot() -> dict:
     if WORKER_HOSTS:
         hosts = WORKER_HOSTS
@@ -409,6 +575,8 @@ def workers_snapshot() -> dict:
     else:
         hosts = []
     snaps = [_parse_worker(h) for h in hosts]
+    for s in snaps:
+        s["stuck"] = _is_stuck(s)
     total_rate = sum((s["metrics"] or {}).get("rate_per_min", 0) for s in snaps if s["metrics"])
     return {
         "workers": snaps,
@@ -417,9 +585,66 @@ def workers_snapshot() -> dict:
             "up": sum(1 for s in snaps if s["status"] == "up"),
             "stalled": sum(1 for s in snaps if s["status"] == "stalled"),
             "down": sum(1 for s in snaps if s["status"] == "down"),
+            "stuck": sum(1 for s in snaps if s.get("stuck")),
             "aggregate_rate_per_min": round(total_rate, 2),
         },
         "ts": _utcnow().isoformat(),
+    }
+
+
+def derived_metrics(workers: dict) -> dict:
+    """Pure derivations on top of workers_snapshot — no Mongo round trips."""
+    snaps = workers.get("workers") or []
+    live = [s for s in snaps if s.get("status") == "up" and s.get("metrics")]
+
+    # Cache hit rate: weight each worker by its observed rate so a quiet worker
+    # with a perfect cache does not skew the headline number. Falls back to a
+    # simple mean when nothing is moving.
+    rate_sum = sum((s["metrics"].get("rate_per_min") or 0) for s in live)
+    if rate_sum > 0:
+        tag_hit = sum((s["metrics"].get("tag_cache_pct") or 0)
+                      * (s["metrics"].get("rate_per_min") or 0) for s in live) / rate_sum
+        img_hit = sum((s["metrics"].get("img_cache_pct") or 0)
+                      * (s["metrics"].get("rate_per_min") or 0) for s in live) / rate_sum
+    elif live:
+        tag_hit = sum((s["metrics"].get("tag_cache_pct") or 0) for s in live) / len(live)
+        img_hit = sum((s["metrics"].get("img_cache_pct") or 0) for s in live) / len(live)
+    else:
+        tag_hit = img_hit = 0.0
+
+    # 429 / token-bucket alert: scan top errors only (already capped at 5 per
+    # worker upstream). Cheap and avoids re-reading log tails.
+    rate_limited_hosts: list[dict] = []
+    total_429 = 0
+    for s in snaps:
+        host = s.get("host")
+        for e in s.get("top_errors") or []:
+            msg = (e.get("msg") or "").lower()
+            if any(mk in msg for mk in RATE_LIMIT_MARKERS):
+                total_429 += int(e.get("count", 0))
+                rate_limited_hosts.append({
+                    "host": host, "count": int(e.get("count", 0)), "msg": e.get("msg"),
+                })
+                break
+
+    stuck_hosts = [s["host"] for s in snaps if s.get("stuck")]
+
+    return {
+        "cache_hit": {
+            "tag_pct": round(tag_hit, 1),
+            "img_pct": round(img_hit, 1),
+            "weighted_by": "rate" if rate_sum > 0 else "uniform",
+            "live_workers": len(live),
+        },
+        "rate_limit_alert": {
+            "active": total_429 > 0,
+            "total_recent": total_429,
+            "hosts": rate_limited_hosts[:5],
+        },
+        "stuck_workers": {
+            "count": len(stuck_hosts),
+            "hosts": stuck_hosts,
+        },
     }
 
 
@@ -642,20 +867,62 @@ async def api_metrics_upload(
 
 @app.get("/api/v1/in-flight", dependencies=[Depends(require_api_key)])
 def api_in_flight(limit: int = 25) -> dict:
+    """In-flight is intentionally cached at TTL_SLOW: the set only changes when
+    a worker claims or releases a repo, which the frontend now polls at the same
+    cadence. The old 10 s TTL meant repeated sort-by-started_at scans for no
+    observable benefit."""
     limit = max(1, min(limit, 100))
-    return {"items": CACHE.get_or_set(f"in_flight:{limit}", TTL_FAST, lambda: in_flight_repos(limit))}
+    return {"items": CACHE.get_or_set(f"in_flight:{limit}", TTL_SLOW, lambda: in_flight_repos(limit))}
 
 
 @app.get("/api/v1/recent", dependencies=[Depends(require_api_key)])
 def api_recent(limit: int = 25) -> dict:
+    """Mongo-heavy: descending sort by tags_backfilled_at. The backing partial
+    index covers it but the list only changes when a worker marks a repo, which
+    is at most ~tens per minute. A 60 s TTL collapses dozens of polls."""
     limit = max(1, min(limit, 100))
-    return {"items": CACHE.get_or_set(f"recent:{limit}", TTL_FAST, lambda: recent_backfilled(limit))}
+    return {"items": CACHE.get_or_set(f"recent:{limit}", TTL_SLOW, lambda: recent_backfilled(limit))}
 
 
 @app.get("/api/v1/top-pending", dependencies=[Depends(require_api_key)])
 def api_top_pending(limit: int = 25) -> dict:
+    """Heaviest read in the dashboard: composite filter + sort by pull_count.
+    Same 60 s TTL as /recent — the head of the queue only changes when something
+    is claimed."""
     limit = max(1, min(limit, 100))
     return {"items": CACHE.get_or_set(f"top_pending:{limit}", TTL_SLOW, lambda: top_pending(limit))}
+
+
+@app.get("/api/v1/extras", dependencies=[Depends(require_api_key)])
+def api_extras() -> dict:
+    """Extra fleet-wide metrics that complement /overview.
+
+    Composition:
+      - tags_collected_24h: ObjectId-bounded count on tags_data, the only
+        leaf that actually quantifies the gain the backfill exists for.
+      - backfilled_24h: matching repo count, so the dashboard can show
+        avg_tags_per_repo without a divide-by-zero dance on the client.
+      - cache_hit / rate_limit_alert / stuck_workers: pure derivations on
+        the already-cached workers snapshot, so they cost zero round trips.
+      - tag_distribution: bounded aggregate, heaviest leaf in the file —
+        TTL_HEAVY (10 min) so even a refresh storm hits Mongo at most once
+        every ten minutes."""
+    workers = CACHE.get_or_set("workers", TTL_FAST, workers_snapshot)
+    tags_24h = CACHE.get_or_set("tags_collected:24", TTL_SLOW, lambda: tags_collected(24))
+    backfilled_24h = CACHE.get_or_set("backfilled_window:24", TTL_SLOW, lambda: backfilled_window(24))
+    distribution = CACHE.get_or_set("tag_distribution", TTL_HEAVY, tag_distribution)
+    derived = derived_metrics(workers)
+    avg_tags = (tags_24h["count"] / backfilled_24h) if backfilled_24h else 0.0
+    return {
+        "tags_collected_24h": tags_24h,
+        "backfilled_24h": backfilled_24h,
+        "avg_tags_per_repo_24h": round(avg_tags, 1),
+        "cache_hit": derived["cache_hit"],
+        "rate_limit_alert": derived["rate_limit_alert"],
+        "stuck_workers": derived["stuck_workers"],
+        "tag_distribution": distribution,
+        "ts": _utcnow().isoformat(),
+    }
 
 
 @app.get("/api/v1/overview", dependencies=[Depends(require_api_key)])

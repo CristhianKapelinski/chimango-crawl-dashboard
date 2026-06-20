@@ -5,7 +5,13 @@
 (() => {
   "use strict";
 
-  const POLL_MS = 10_000;
+  /* Two polling cadences: fast leaves (overview/workers/history) refresh every
+     POLL_FAST_MS so live state stays live; slow leaves (in-flight, recently
+     completed, next-in-queue, fleet-wide extras) refresh every POLL_SLOW_MS.
+     Backend TTLs are aligned so polling more aggressively would only churn the
+     cache without reaching Mongo any sooner. */
+  const POLL_FAST_MS = 10_000;
+  const POLL_SLOW_MS = 60_000;
   const KEY_STORAGE = "crawl-backfill-apikey";
   const BASE = (document.documentElement.dataset.apiBase || "").replace(/\/$/, "");
 
@@ -100,8 +106,14 @@
     const list = $("#workers");
     list.innerHTML = "";
     const summary = snap.summary || {};
-    $("#workers-summary").textContent =
-      `${summary.up || 0} up · ${summary.stalled || 0} stalled · ${summary.down || 0} down · aggregate ${(summary.aggregate_rate_per_min || 0).toFixed(1)} repos/min`;
+    const parts = [
+      `${summary.up || 0} up`,
+      `${summary.stalled || 0} stalled`,
+      `${summary.down || 0} down`,
+    ];
+    if (summary.stuck) parts.push(`${summary.stuck} stuck`);
+    parts.push(`aggregate ${(summary.aggregate_rate_per_min || 0).toFixed(1)} repos/min`);
+    $("#workers-summary").textContent = parts.join(" · ");
 
     if (!snap.workers || snap.workers.length === 0) {
       list.innerHTML = `<p class="sec-desc">no worker logs found yet — workers write to WORKER_LOGS_DIR.</p>`;
@@ -111,17 +123,19 @@
       const node = document.createElement("article");
       node.className = "worker";
       node.dataset.state = w.status;
+      if (w.stuck) node.dataset.stuck = "true";
       node.setAttribute("role", "listitem");
 
       const m = w.metrics || {};
       const lastSeen = w.last_seen_seconds == null ? "—"
         : (w.last_seen_seconds < 90 ? `${w.last_seen_seconds}s` : `${Math.round(w.last_seen_seconds / 60)}m`);
       const topErr = (w.top_errors && w.top_errors[0]) || null;
+      const pillLabel = w.stuck ? `${w.status} · stuck` : w.status;
 
       node.innerHTML = `
         <div class="top">
           <span class="host">${escapeHTML(w.host)}</span>
-          <span class="pill">${escapeHTML(w.status)}</span>
+          <span class="pill">${escapeHTML(pillLabel)}</span>
         </div>
         <div class="row"><span class="k">rate</span><span class="v">${m.rate_per_min != null ? m.rate_per_min.toFixed(1) : "—"} /min</span></div>
         <div class="row"><span class="k">processed</span><span class="v">${m.processed != null ? fmtInt(m.processed) : "—"}</span></div>
@@ -134,6 +148,58 @@
     }
 
     renderErrorsRollup(snap.workers);
+  }
+
+  /* ---------- extras (fleet-wide derived + slow leaves) ---------- */
+
+  function renderExtras(ex) {
+    if (!ex) return;
+    const collected = ex.tags_collected_24h && ex.tags_collected_24h.count;
+    $("#extra-tags-24h").textContent = collected != null ? fmtInt(collected) : "—";
+    $("#extra-tags-24h-sub").textContent = `${fmtInt(ex.backfilled_24h || 0)} repos · avg ${ex.avg_tags_per_repo_24h ?? 0} tags/repo`;
+
+    const ch = ex.cache_hit || {};
+    $("#extra-cache").textContent = ch.tag_pct != null ? `${ch.tag_pct.toFixed(1)}%` : "—";
+    $("#extra-cache-sub").textContent =
+      `imgs ${ch.img_pct != null ? ch.img_pct.toFixed(1) : "—"}% · ${ch.live_workers || 0} live workers · ${ch.weighted_by || "—"}`;
+
+    const stuck = ex.stuck_workers || {};
+    const stuckCard = $("#extra-stuck-card");
+    $("#extra-stuck").textContent = String(stuck.count || 0);
+    $("#extra-stuck-sub").textContent = (stuck.hosts && stuck.hosts.length)
+      ? stuck.hosts.slice(0, 3).join(", ") + (stuck.hosts.length > 3 ? ` +${stuck.hosts.length - 3}` : "")
+      : "all live workers producing";
+    stuckCard.dataset.tone = stuck.count > 0 ? "warn" : "";
+
+    const alert = ex.rate_limit_alert || {};
+    const alertBar = $("#rate-alert");
+    if (alert.active) {
+      alertBar.hidden = false;
+      const hostList = (alert.hosts || []).map((h) => escapeHTML(h.host)).join(", ");
+      alertBar.querySelector(".rate-alert-msg").textContent =
+        `Docker Hub rate-limit signal detected on ${(alert.hosts || []).length} worker(s): ${hostList}. Total recent hits: ${alert.total_recent}.`;
+    } else {
+      alertBar.hidden = true;
+    }
+
+    const dist = ex.tag_distribution || {};
+    const distList = $("#extra-distribution");
+    if (!dist.buckets || !dist.buckets.length) {
+      distList.innerHTML = `<li class="dist-empty">no distribution data yet</li>`;
+    } else {
+      const max = Math.max(1, ...dist.buckets.map((b) => b.count));
+      distList.innerHTML = dist.buckets.map((b) => {
+        const pct = (b.count / max) * 100;
+        return `<li>
+          <span class="dist-label">${escapeHTML(b.label)} tags</span>
+          <span class="dist-bar" aria-hidden="true"><span class="dist-fill" style="width:${pct.toFixed(1)}%"></span></span>
+          <span class="dist-count mono">${fmtInt(b.count)}</span>
+        </li>`;
+      }).join("");
+    }
+    $("#extra-distribution-sub").textContent = dist.sample_repos
+      ? `n=${fmtInt(dist.sample_repos)} repos · last ${dist.hours || 24} h`
+      : "no repos in window";
   }
 
   function renderErrorsRollup(workers) {
@@ -219,20 +285,24 @@
     }
   }
 
-  /* ---------- main poll loop ---------- */
+  /* ---------- main poll loop ----------
+     Split into fast (live state) and slow (queue + fleet-wide derived). The
+     in-flight / recently-completed / next-in-queue panels back Mongo queries
+     that only change on claim/mark events — polling them every second was
+     paying for an empty diff. Backend TTLs match so the slow cadence does
+     not desync. */
 
-  let inflight = false;
+  let fastInflight = false;
+  let slowInflight = false;
+  const lastSlowTs = { v: 0 };
 
-  async function tick() {
-    if (inflight) return;
-    inflight = true;
+  async function tickFast() {
+    if (fastInflight) return;
+    fastInflight = true;
     try {
-      const [overview, history, inflightItems, recent, topPending] = await Promise.all([
+      const [overview, history] = await Promise.all([
         Api.get("/api/v1/overview"),
         Api.get("/api/v1/history"),
-        Api.get("/api/v1/in-flight?limit=15"),
-        Api.get("/api/v1/recent?limit=15"),
-        Api.get("/api/v1/top-pending?limit=20"),
       ]);
 
       renderKpis(overview.progress);
@@ -242,6 +312,30 @@
 
       $("#agg-rate").textContent = (overview.eta.rate_per_min || 0).toFixed(1);
       $("#eta-human").textContent = overview.eta.human || "—";
+
+      $("#last-update").textContent = fmtTime(overview.ts);
+      $("#last-update").dateTime = overview.ts;
+      Health.set("ok", "live");
+    } catch (e) {
+      console.error("tickFast", e);
+      if (e.status === 401) { await askForKey(); }
+      else { Health.set("degraded", e.message || "error"); }
+    } finally {
+      fastInflight = false;
+    }
+  }
+
+  async function tickSlow(force) {
+    if (slowInflight) return;
+    if (!force && Date.now() - lastSlowTs.v < POLL_SLOW_MS - 1_000) return;
+    slowInflight = true;
+    try {
+      const [inflightItems, recent, topPending, extras] = await Promise.all([
+        Api.get("/api/v1/in-flight?limit=15"),
+        Api.get("/api/v1/recent?limit=15"),
+        Api.get("/api/v1/top-pending?limit=20"),
+        Api.get("/api/v1/extras"),
+      ]);
 
       renderRepoList("#inflight-list", inflightItems.items, {
         empty: "no workers are claiming repos right now",
@@ -254,17 +348,21 @@
       renderRepoList("#top-list", topPending.items, {
         empty: "queue is drained",
       });
+      renderExtras(extras);
 
-      $("#last-update").textContent = fmtTime(overview.ts);
-      $("#last-update").dateTime = overview.ts;
-      Health.set("ok", "live");
+      lastSlowTs.v = Date.now();
     } catch (e) {
-      console.error("tick", e);
+      console.error("tickSlow", e);
       if (e.status === 401) { await askForKey(); }
-      else { Health.set("degraded", e.message || "error"); }
+      // do not demote health for slow-cycle failures; the fast cycle owns the badge
     } finally {
-      inflight = false;
+      slowInflight = false;
     }
+  }
+
+  function tickAll(force) {
+    tickFast();
+    tickSlow(force);
   }
 
   /* ---------- auth dialog ---------- */
@@ -276,23 +374,28 @@
     input.value = Api.key || "";
     if (typeof dlg.showModal === "function") {
       dlg.showModal();
-      $("#auth-save").addEventListener("click", () => { Api.setKey(input.value.trim()); tick(); }, { once: true });
+      $("#auth-save").addEventListener("click", () => { Api.setKey(input.value.trim()); tickAll(true); }, { once: true });
     } else {
       const k = prompt("API key:");
-      if (k) { Api.setKey(k); tick(); }
+      if (k) { Api.setKey(k); tickAll(true); }
     }
   }
 
   /* ---------- boot ---------- */
 
   function boot() {
-    $("#poll-interval").textContent = String(POLL_MS / 1000);
-    $("#refresh").addEventListener("click", () => tick());
+    $("#poll-fast").textContent = String(POLL_FAST_MS / 1000);
+    $("#poll-slow").textContent = String(POLL_SLOW_MS / 1000);
+    /* Manual refresh forces both cycles to fire immediately — useful when an
+       operator just claimed/marked a repo and wants to see the queue update
+       without waiting for the slow cadence. */
+    $("#refresh").addEventListener("click", () => tickAll(true));
     if (!Api.key) { askForKey(); return; }
-    tick();
-    setInterval(tick, POLL_MS);
+    tickAll(true);
+    setInterval(tickFast, POLL_FAST_MS);
+    setInterval(() => tickSlow(false), POLL_SLOW_MS);
     document.addEventListener("visibilitychange", () => {
-      if (!document.hidden) tick();
+      if (!document.hidden) tickAll(true);
     });
   }
 

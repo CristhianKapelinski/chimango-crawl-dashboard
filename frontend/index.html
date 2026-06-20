@@ -33,6 +33,11 @@
 
 <main id="main">
 
+  <div id="rate-alert" class="alert" role="status" aria-live="polite" hidden>
+    <span class="alert-tag">rate-limit</span>
+    <span class="rate-alert-msg"></span>
+  </div>
+
   <section aria-labelledby="kpi-h">
     <h2 id="kpi-h" class="sec-title">overview</h2>
     <div class="kpis" id="kpis">
@@ -52,6 +57,35 @@
         <span><span class="legend inflight"></span> in flight</span>
         <span><span class="legend pending"></span> pending</span>
       </div>
+    </div>
+  </section>
+
+  <section aria-labelledby="extras-h">
+    <h2 id="extras-h" class="sec-title">fleet signal</h2>
+    <p class="sec-desc">derived metrics refreshed every 60 s · cheap to serve</p>
+    <div class="kpis">
+      <div class="kpi" data-tone="accent">
+        <div class="lbl">tags collected · 24 h</div>
+        <div class="val" id="extra-tags-24h">—</div>
+        <div class="sub" id="extra-tags-24h-sub">—</div>
+      </div>
+      <div class="kpi">
+        <div class="lbl">cache hit · tags</div>
+        <div class="val" id="extra-cache">—</div>
+        <div class="sub" id="extra-cache-sub">—</div>
+      </div>
+      <div class="kpi" id="extra-stuck-card">
+        <div class="lbl">stuck workers</div>
+        <div class="val" id="extra-stuck">—</div>
+        <div class="sub" id="extra-stuck-sub">—</div>
+      </div>
+    </div>
+    <div class="dist-card" role="group" aria-labelledby="dist-h">
+      <div class="dist-meta">
+        <span id="dist-h">tag-count distribution per backfilled repo</span>
+        <span id="extra-distribution-sub" class="mono"></span>
+      </div>
+      <ul class="dist-list" id="extra-distribution"></ul>
     </div>
   </section>
 
@@ -108,7 +142,7 @@
 </main>
 
 <footer role="contentinfo">
-  <span>crawl backfill monitor · polling every <span id="poll-interval">10</span> s</span>
+  <span>crawl backfill monitor · fast cycle <span id="poll-fast">10</span> s · slow cycle <span id="poll-slow">60</span> s</span>
   <span class="mono">source: <a href="https://github.com/CristhianKapelinski/chimango-crawl-dashboard">cristhiankapelinski/chimango-crawl-dashboard</a></span>
 </footer>
 
